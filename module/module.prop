@@ -1,0 +1,7 @@
+id=targetedhide
+name=TargetedHide
+version=v1
+versionCode=100
+author=Vision/VisionR1
+description=Ηide files, folders, and packages from specific target apps.
+updateJson=https://raw.githubusercontent.com/VisionR1/TargetedHide/main/update.json

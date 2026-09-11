@@ -1,0 +1,8 @@
+# One app process per line. Comments start with #.
+# TargetedHide ONLY affects the apps listed here. All other apps are completely untouched.
+#
+# Note: For multi-process apps, both ':' and '.' work 
+# (e.g., "com.app:ui" and "com.app.ui" are treated exactly the same).
+#
+# Example:
+# com.example.somefilemanager

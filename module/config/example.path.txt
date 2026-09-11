@@ -1,0 +1,25 @@
+# Rename to path.txt once completed
+#
+# Global hide rules (applies to all targets unless config/<process>.txt exists).
+# Rules: '/' = exact path | no '/' = package match | '!' = exclusion
+
+# Standard folder and file hiding
+# /storage/emulated/0/Download/Example
+# /storage/emulated/0/DCIM/example.jpg
+
+# Keep specific files or subfolders visible inside a hidden path
+# !/storage/emulated/0/Download/Example/Allowed.txt
+
+# Package matching (hides specific app install folders)
+# com.example.someapp
+
+# If hiding the entire /data/app directory:
+# /data/app
+
+# IMPORTANT: You MUST exclude every target app using this global list!
+# Otherwise, they will hide their own files and crash on launch.
+# !com.example.firsttarget
+# !com.example.secondtarget
+
+# You can also exclude any other apps you want this target app to still see
+# !com.example.appyouwanttokeepvisible
