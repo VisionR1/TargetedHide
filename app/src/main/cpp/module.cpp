@@ -604,7 +604,7 @@ public:
         }
 
         if (isAppTarget && !dexBytes.empty()) {
-            injectPackageManagerProxy();
+            injectJavaProxies();
         }
     }
 
@@ -674,16 +674,15 @@ private:
         return result.empty() ? rawBytes : result;
     }
 
-    void injectPackageManagerProxy() {
-        // Send ALL rules to Java (hidden AND excluded)
+    void injectJavaProxies() {
         std::vector<std::string> proxyRules;
         for (auto &r: g_hiddenPaths) {
             proxyRules.push_back(r.pattern);
         }
         for (auto &r: g_excludedPaths) {
-            proxyRules.push_back("!" + r.pattern); // Keep the '!' prefix for Java to parse
+            proxyRules.push_back("!" + r.pattern);
         }
-        
+
         if (proxyRules.empty()) return;
 
         jclass dexLoaderClass = env->FindClass("dalvik/system/InMemoryDexClassLoader");
@@ -710,12 +709,6 @@ private:
         jclass classLoaderClass = env->GetObjectClass(dexClassLoader);
         jmethodID loadClassMethod = env->GetMethodID(classLoaderClass, "loadClass",
             "(Ljava/lang/String;)Ljava/lang/Class;");
-        jstring className = env->NewStringUTF("el.vision.targetedhide.PackageManagerProxy");
-        auto proxyClass = (jclass) env->CallObjectMethod(dexClassLoader, loadClassMethod, className);
-        if (checkAndClearException("loadClass PackageManagerProxy") || proxyClass == nullptr) return;
-
-        jmethodID injectMethod = env->GetStaticMethodID(proxyClass, "inject", "([Ljava/lang/String;)V");
-        if (checkAndClearException("GetStaticMethodID inject") || injectMethod == nullptr) return;
 
         jclass stringClass = env->FindClass("java/lang/String");
         auto hiddenArray = env->NewObjectArray((jsize) proxyRules.size(), stringClass, nullptr);
@@ -725,10 +718,29 @@ private:
             env->DeleteLocalRef(pkg);
         }
 
-        env->CallStaticVoidMethod(proxyClass, injectMethod, hiddenArray);
-        if (checkAndClearException("inject() invocation")) return;
+        // --- PackageManagerProxy ---
+        jstring pmClassName = env->NewStringUTF("el.vision.targetedhide.PackageManagerProxy");
+        auto pmClass = (jclass) env->CallObjectMethod(dexClassLoader, loadClassMethod, pmClassName);
+        if (!checkAndClearException("loadClass PackageManagerProxy") && pmClass != nullptr) {
+            jmethodID pmInject = env->GetStaticMethodID(pmClass, "inject", "([Ljava/lang/String;)V");
+            if (!checkAndClearException("GetStaticMethodID PM inject") && pmInject != nullptr) {
+                env->CallStaticVoidMethod(pmClass, pmInject, hiddenArray);
+                checkAndClearException("PackageManagerProxy inject() invocation");
+            }
+        }
 
-        LOGD("PackageManager proxy active, %zu rules loaded", proxyRules.size());
+        // --- MediaStoreHideProxy ---
+        jstring msClassName = env->NewStringUTF("el.vision.targetedhide.MediaStoreHideProxy");
+        auto msClass = (jclass) env->CallObjectMethod(dexClassLoader, loadClassMethod, msClassName);
+        if (!checkAndClearException("loadClass MediaStoreHideProxy") && msClass != nullptr) {
+            jmethodID msInject = env->GetStaticMethodID(msClass, "inject", "([Ljava/lang/String;)V");
+            if (!checkAndClearException("GetStaticMethodID MS inject") && msInject != nullptr) {
+                env->CallStaticVoidMethod(msClass, msInject, hiddenArray);
+                checkAndClearException("MediaStoreHideProxy inject() invocation");
+            }
+        }
+
+        LOGD("Java proxies injected, %zu rules loaded", proxyRules.size());
     }
 };
 
