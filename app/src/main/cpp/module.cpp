@@ -6,9 +6,11 @@
 #include <cerrno>
 #include <cstring>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 #include <string>
+#include <string_view>
 #include <cstdio>
 #include <dlfcn.h>
 #include <dirent.h> 
@@ -47,6 +49,7 @@ struct PathRule {
 
 static std::vector<PathRule> g_hiddenPaths;
 static std::vector<PathRule> g_excludedPaths;
+static bool g_hasSubstringHideRule = false;
 
 static std::string sanitizePath(const std::string& path) {
     std::vector<std::string> parts;
@@ -151,10 +154,27 @@ static bool isHidden(const std::string &rawPath) {
     return false;
 }
 
+static bool isHiddenDirect(const std::string &path) {
+    if (path.empty() || path == "/") return false;
+
+    for (const auto &r: g_excludedPaths) {
+        if (matchesRule(path, r)) return false;
+    }
+    for (const auto &r: g_hiddenPaths) {
+        if (matchesRule(path, r)) {
+            if (!r.isSubstring && hasNestedExclude(path)) {
+                continue;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 // =======================================================================
 // FD Resolution via Kernel & Reentrancy Guard
 // =======================================================================
-static std::mutex g_fdMutex;
+static std::shared_mutex g_fdMutex;
 static std::unordered_map<int, std::string> g_fdToPath;
 
 static thread_local bool t_in_hook = false;
@@ -194,6 +214,55 @@ static std::string resolveFullPath(int dirfd, const char *pathname) {
 }
 
 // =======================================================================
+// FAST Path Resolution (Eliminates File Manager Lag)
+// =======================================================================
+static std::string resolveFdPathFast(int fd) {
+    if (fd == AT_FDCWD) {
+        char cwd[4096];
+        if (getcwd(cwd, sizeof(cwd)) != nullptr) return sanitizePath(cwd);
+        return "";
+    }
+    
+    // Use shared_lock so multiple threads can read the cache simultaneously!
+    {
+        std::shared_lock<std::shared_mutex> lock(g_fdMutex);
+        auto it = g_fdToPath.find(fd);
+        if (it != g_fdToPath.end()) return it->second;
+    }
+
+    char linkPath[64], resolved[4096];
+    snprintf(linkPath, sizeof(linkPath), "/proc/self/fd/%d", fd);
+    ssize_t len = readlink(linkPath, resolved, sizeof(resolved) - 1);
+    if (len <= 0) return "";
+    resolved[len] = '\0';
+    return sanitizePath(resolved);
+}
+
+static std::string resolveFullPathFast(int dirfd, const char *pathname) {
+    if (!pathname) return "";
+    if (pathname[0] == '/') return sanitizePath(pathname);
+    
+    std::string base = resolveFdPathFast(dirfd);
+    if (base.empty()) return "";
+    return joinPath(base, pathname);
+}
+
+static bool dirNeedsFiltering(std::string_view path) {
+    if (path.empty()) return false; 
+    
+    // If a substring rule exists, we cannot rely solely on prefix matching
+    if (g_hasSubstringHideRule) return true; 
+
+    for (const auto& rule : g_hiddenPaths) {
+        std::string_view hidden = rule.pattern; 
+        if (path.starts_with(hidden) || hidden.starts_with(path)) {
+            return true; 
+        }
+    }
+    return false;
+}
+
+// =======================================================================
 // Hooks
 // =======================================================================
 
@@ -217,12 +286,9 @@ static int my_open(const char* pathname, int flags, ...) {
     }
 
     int fd = (flags & O_CREAT) ? o_open(pathname, flags, mode) : o_open(pathname, flags);
-    if (fd >= 0) {
-        std::string realPath = resolveFdPath(fd);
-        if (!realPath.empty()) {
-            std::lock_guard<std::mutex> lock(g_fdMutex);
-            g_fdToPath[fd] = realPath;
-        }
+    if (fd >= 0 && !fullPath.empty()) {
+        std::unique_lock<std::shared_mutex> lock(g_fdMutex);
+        g_fdToPath[fd] = fullPath;
     }
     return fd;
 }
@@ -247,12 +313,9 @@ static int my_openat(int dirfd, const char *pathname, int flags, ...) {
     }
 
     int fd = (flags & O_CREAT) ? o_openat(dirfd, pathname, flags, mode) : o_openat(dirfd, pathname, flags);
-    if (fd >= 0) {
-        std::string realPath = resolveFdPath(fd);
-        if (!realPath.empty()) {
-            std::lock_guard<std::mutex> lock(g_fdMutex);
-            g_fdToPath[fd] = realPath;
-        }
+    if (fd >= 0 && !fullPath.empty()) {
+        std::unique_lock<std::shared_mutex> lock(g_fdMutex);
+        g_fdToPath[fd] = fullPath;
     }
     return fd;
 }
@@ -263,7 +326,7 @@ static int my_close(int fd) {
     if (t_in_hook) return o_close(fd);
     HookGuard guard;
     {
-        std::lock_guard<std::mutex> lock(g_fdMutex);
+        std::unique_lock<std::shared_mutex> lock(g_fdMutex);
         g_fdToPath.erase(fd);
     }
     return o_close(fd);
@@ -275,12 +338,22 @@ static DIR* my_opendir(const char* name) {
     if (t_in_hook) return o_opendir(name);
     HookGuard guard;
 
+    // Resolve symlinks once per opendir() and cache the canonical path for directory entries.
     std::string fullPath = resolveFullPath(AT_FDCWD, name);
-    if (!fullPath.empty() && isHidden(fullPath)) {
+    if (!fullPath.empty() && isHiddenDirect(fullPath)) {
         errno = ENOENT;
         return nullptr;
     }
-    return o_opendir(name);
+
+    DIR* dir = o_opendir(name);
+    if (dir) {
+        int fd = dirfd(dir);
+        if (fd >= 0 && !fullPath.empty()) {
+            std::unique_lock<std::shared_mutex> lock(g_fdMutex);
+            g_fdToPath[fd] = fullPath; // Store resolved path for file lookups
+        }
+    }
+    return dir;
 }
 
 typedef struct dirent* (*readdir_t)(DIR*);
@@ -290,21 +363,30 @@ static struct dirent* my_readdir(DIR* dirp) {
     if (t_in_hook) return o_readdir(dirp);
     HookGuard guard;
 
+    int fd = dirfd(dirp);
+    std::string dirPath;
+    if (fd >= 0) {
+        std::shared_lock<std::shared_mutex> lock(g_fdMutex);
+        auto it = g_fdToPath.find(fd);
+        if (it != g_fdToPath.end()) dirPath = it->second;
+    }
+    if (dirPath.empty()) {
+        dirPath = resolveFdPath(fd);
+    }
+
+    // FAST EXIT: If this folder has nothing to do with hide rules, 
+    // return immediately without processing individual files!
+    if (dirPath.empty() || !dirNeedsFiltering(dirPath)) {
+        return o_readdir(dirp);
+    }
+
     struct dirent* entry;
     while ((entry = o_readdir(dirp)) != nullptr) {
         std::string name(entry->d_name);
         if (name == "." || name == "..") return entry;
 
-        int fd = dirfd(dirp);
-        std::string dirPath;
-        if (fd >= 0) {
-            std::lock_guard<std::mutex> lock(g_fdMutex);
-            auto it = g_fdToPath.find(fd);
-            if (it != g_fdToPath.end()) dirPath = it->second;
-            else dirPath = resolveFdPath(fd);
-        }
-        
-        if (!dirPath.empty() && isHidden(joinPath(dirPath, name))) continue; 
+        // Use isHiddenNormalized to avoid heavy disk realpath checks per file
+        if (isHiddenDirect(joinPath(dirPath, name))) continue;
         return entry;
     }
     return nullptr;
@@ -329,13 +411,16 @@ static long my_getdents64(unsigned int fd, void *dirp, unsigned int count) {
 
     std::string dirPath;
     {
-        std::lock_guard<std::mutex> lock(g_fdMutex);
+        std::shared_lock<std::shared_mutex> lock(g_fdMutex);
         auto it = g_fdToPath.find((int) fd);
         if (it != g_fdToPath.end()) dirPath = it->second;
-        else dirPath = resolveFdPath((int)fd);
+    }
+    if (dirPath.empty()) {
+        dirPath = resolveFdPath((int) fd); // Safe: lock is released
     }
 
-    if (dirPath.empty()) return nread;
+    // FAST EXIT: If folder is not related to hidden paths, return immediately without checking files
+    if (dirPath.empty() || !dirNeedsFiltering(dirPath)) return nread;
 
     char *base = (char *) dirp;
     long outOffset = 0, inOffset = 0;
@@ -343,7 +428,7 @@ static long my_getdents64(unsigned int fd, void *dirp, unsigned int count) {
     while (inOffset < nread) {
         auto *entry = (linux_dirent64 *) (base + inOffset);
         std::string name(entry->d_name);
-        bool drop = (name != "." && name != ".." && isHidden(joinPath(dirPath, name)));
+        bool drop = (name != "." && name != ".." && isHiddenDirect(joinPath(dirPath, name)));
 
         if (!drop) {
             if (outOffset != inOffset) memmove(base + outOffset, entry, entry->d_reclen);
@@ -360,8 +445,11 @@ static int my_stat(const char *path, struct stat *buf) {
     if (t_in_hook) return o_stat(path, buf);
     HookGuard guard;
 
-    std::string fullPath = resolveFullPath(AT_FDCWD, path);
-    if (!fullPath.empty() && isHidden(fullPath)) {
+    std::string fastPath = resolveFullPathFast(AT_FDCWD, path);
+    if (!dirNeedsFiltering(fastPath)) return o_stat(path, buf);
+
+    // Use isHiddenDirect to avoid redundant disk realpath calls
+    if (!fastPath.empty() && isHiddenDirect(fastPath)) {
         errno = ENOENT;
         return -1;
     }
@@ -374,8 +462,10 @@ static int my_lstat(const char *path, struct stat *buf) {
     if (t_in_hook) return o_lstat(path, buf);
     HookGuard guard;
 
-    std::string fullPath = resolveFullPath(AT_FDCWD, path);
-    if (!fullPath.empty() && isHidden(fullPath)) {
+    std::string fastPath = resolveFullPathFast(AT_FDCWD, path);
+    if (!dirNeedsFiltering(fastPath)) return o_lstat(path, buf);
+
+    if (!fastPath.empty() && isHiddenDirect(fastPath)) {
         errno = ENOENT;
         return -1;
     }
@@ -388,8 +478,10 @@ static int my_fstatat(int dirfd, const char *path, struct stat *buf, int flags) 
     if (t_in_hook) return o_fstatat(dirfd, path, buf, flags);
     HookGuard guard;
 
-    std::string fullPath = resolveFullPath(dirfd, path);
-    if (!fullPath.empty() && isHidden(fullPath)) {
+    std::string fastPath = resolveFullPathFast(dirfd, path);
+    if (!dirNeedsFiltering(fastPath)) return o_fstatat(dirfd, path, buf, flags);
+
+    if (!fastPath.empty() && isHiddenDirect(fastPath)) {
         errno = ENOENT;
         return -1;
     }
@@ -582,8 +674,13 @@ public:
                     break;
                 }
             }
-            if (!dup) list.push_back(std::move(rule));
-        }
+            if (!dup) {
+                if (isSubstring && !isExclude) {
+                    g_hasSubstringHideRule = true;
+                }
+                list.push_back(std::move(rule));
+            }
+		}
 
         // 7. Receive classes.dex bytes (0-length means the proxy feature is disabled)
         uint32_t dexSize = 0;
