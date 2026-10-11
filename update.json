@@ -1,6 +1,6 @@
 {
-    "version": "v2",
-    "versionCode": 200,
-    "zipUrl": "https://github.com/VisionR1/TargetedHide/releases/download/v2/TargetedHide-v2.zip",
+    "version": "v3",
+    "versionCode": 300,
+    "zipUrl": "https://github.com/VisionR1/TargetedHide/releases/download/v3/TargetedHide-v3.zip",
     "changelog": "https://raw.githubusercontent.com/VisionR1/TargetedHide/main/CHANGELOG.md"
 }
